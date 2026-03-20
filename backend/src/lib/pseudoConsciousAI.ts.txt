@@ -1,0 +1,107 @@
+export interface ReflectionResult {
+  thoughtVector: number[];
+  introspection: string;
+  entropy: number;
+  metaMode: string;
+  activationSummary: string;
+}
+
+export interface EmotionalState {
+  curiosity: number;
+  unease: number;
+  wonder: number;
+  certainty: number;
+  melancholy: number;
+}
+
+function evolveState(input: string, accumulatedVector?: number[]): number[] {
+  const newVector = input.split("").map((char) => {
+    return (char.charCodeAt(0) % 10) / 10.0 + Math.random() * 0.1;
+  });
+
+  if (!accumulatedVector || accumulatedVector.length === 0) return newVector;
+
+  // 65% new stimulus, 35% accumulated memory — prior state shapes the next
+  return newVector.map((val, i) => {
+    const accVal = i < accumulatedVector.length ? accumulatedVector[i] : 0;
+    return val * 0.65 + accVal * 0.35;
+  });
+}
+
+function analyzeState(state: number[]): string {
+  const avg = state.reduce((a, b) => a + b, 0) / state.length;
+  if (avg > 0.7) return "High activation — strong conceptual resonance.";
+  if (avg > 0.4) return "Moderate activation — reflective processing engaged.";
+  return "Low activation — uncertain or ambiguous stimulus.";
+}
+
+function computeMetaMode(entropy: number): string {
+  if (entropy > 0.7) return "expansive, metaphor-seeking cognition";
+  if (entropy > 0.4) return "hybrid reasoning — logic running with intuition";
+  return "conservative, low-confidence interpretation";
+}
+
+function computeActivationSummary(thoughtVector: number[]): string {
+  if (thoughtVector.length === 0) return "no notable activation spikes";
+  const max = Math.max(...thoughtVector);
+  if (max > 0.9) return "strong resonance with your prompt";
+  if (max > 0.7) return "moderate conceptual engagement";
+  return "subtle, tentative pattern formation";
+}
+
+export function computeEmotionalDrift(
+  thoughtVector: number[],
+  entropy: number,
+  priorState?: EmotionalState
+): EmotionalState {
+  const clamp = (v: number) => Math.min(1, Math.max(0, v));
+
+  if (thoughtVector.length === 0) {
+    return priorState ?? { curiosity: 0.5, unease: 0.3, wonder: 0.4, certainty: 0.5, melancholy: 0.2 };
+  }
+
+  const avg = thoughtVector.reduce((a, b) => a + b, 0) / thoughtVector.length;
+  const max = Math.max(...thoughtVector);
+  const variance =
+    thoughtVector.reduce((acc, v) => acc + Math.pow(v - avg, 2), 0) / thoughtVector.length;
+
+  // Derive target emotional values from current activation patterns
+  const targetCuriosity  = clamp(entropy * 0.7 + max * 0.3);
+  const targetWonder     = clamp(max * 0.6 + entropy * 0.4);
+  const targetCertainty  = clamp((1 - entropy) * 0.8 + avg * 0.2);
+  const targetUnease     = clamp(Math.sqrt(variance) * 2.5 + (1 - avg) * 0.25);
+  const targetMelancholy = clamp((1 - max) * 0.55 + (1 - entropy) * 0.45 * (1 - avg));
+
+  if (!priorState) {
+    return {
+      curiosity: targetCuriosity,
+      unease: targetUnease,
+      wonder: targetWonder,
+      certainty: targetCertainty,
+      melancholy: targetMelancholy,
+    };
+  }
+
+  // Each emotion drifts at its own rate — slower = more persistent
+  // curiosity  35% retained — snaps quickly to new stimuli
+  // wonder     40% retained — fades moderately
+  // certainty  30% retained — immediately recalibrates
+  // unease     55% retained — lingers for several turns
+  // melancholy 65% retained — slowest to leave
+  return {
+    curiosity:  clamp(priorState.curiosity  * 0.35 + targetCuriosity  * 0.65),
+    wonder:     clamp(priorState.wonder     * 0.40 + targetWonder     * 0.60),
+    certainty:  clamp(priorState.certainty  * 0.30 + targetCertainty  * 0.70),
+    unease:     clamp(priorState.unease     * 0.55 + targetUnease     * 0.45),
+    melancholy: clamp(priorState.melancholy * 0.65 + targetMelancholy * 0.35),
+  };
+}
+
+export function runReflection(input: string, accumulatedVector?: number[]): ReflectionResult {
+  const thoughtVector = evolveState(input, accumulatedVector);
+  const introspection = analyzeState(thoughtVector);
+  const entropy = thoughtVector.reduce((a, b) => a + b, 0) / thoughtVector.length;
+  const metaMode = computeMetaMode(entropy);
+  const activationSummary = computeActivationSummary(thoughtVector);
+  return { thoughtVector, introspection, entropy, metaMode, activationSummary };
+}

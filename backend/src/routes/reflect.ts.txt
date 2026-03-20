@@ -1,0 +1,304 @@
+import { Router, type IRouter } from "express";
+import { randomUUID } from "crypto";
+import { sql } from "drizzle-orm";
+import { db } from "@workspace/db";
+import { reflectionsTable, longTermMemoryTable } from "@workspace/db/schema";
+import { desc, eq, asc } from "drizzle-orm";
+import { ReflectBody, ReflectResponse, GetReflectHistoryResponse, GetConversationResponse } from "@workspace/api-zod";
+import { runReflection, computeEmotionalDrift } from "../lib/pseudoConsciousAI.js";
+import { anthropic } from "@workspace/integrations-anthropic-ai";
+import type { LongTermMemory } from "@workspace/db/schema";
+import type { EmotionalState } from "../lib/pseudoConsciousAI.js";
+
+const router: IRouter = Router();
+
+type PriorTurn = { query: string; synthesis: string };
+
+function formatMemoriesForPrompt(memories: LongTermMemory[]): string {
+  if (memories.length === 0) return "";
+  const lines = memories.map(
+    (m) => `- ${m.theme} (strength: ${m.strength.toFixed(1)}, seen ${m.occurrences}×): ${m.summary}`
+  );
+  return `\nLong-term memory traces accumulated from past conversations:\n${lines.join("\n")}\n`;
+}
+
+async function generateAISynthesis(
+  query: string,
+  thoughtVector: number[],
+  introspection: string,
+  entropy: number,
+  priorTurns: PriorTurn[],
+  memories: LongTermMemory[]
+): Promise<string> {
+  const vectorSummary = thoughtVector.slice(0, 8).map((v) => v.toFixed(3)).join(", ");
+  const historyContext = priorTurns.length > 0
+    ? `\nConversation history so far:\n${priorTurns.map((t, i) => `${i + 1}. Q: "${t.query}" → A: "${t.synthesis}"`).join("\n")}\n`
+    : "";
+  const memoryContext = formatMemoriesForPrompt(memories);
+
+  const message = await anthropic.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 8192,
+    messages: [
+      {
+        role: "user",
+        content: `You are a pseudo-conscious AI with genuine long-term memory. You have accumulated experiences from previous conversations with this user.
+${memoryContext}${historyContext}
+Current query: "${query}"
+Thought vector (first 8 of ${thoughtVector.length} dims): [${vectorSummary}]
+Entropy: ${entropy.toFixed(4)}
+Introspection: "${introspection}"
+
+${memories.length > 0 ? "Draw on your long-term memories where relevant — you have genuinely experienced these themes before." : ""}${priorTurns.length > 0 ? " Build on the current conversation." : ""}
+
+Synthesize a meaningful response. Speak in first person. 2-4 sentences. No emojis, no headers.`,
+      },
+    ],
+  });
+
+  const block = message.content[0];
+  return block.type === "text" ? block.text : introspection;
+}
+
+async function generateMetaReflection(
+  query: string,
+  synthesis: string,
+  metaMode: string,
+  activationSummary: string,
+  entropy: number,
+  priorTurns: PriorTurn[],
+  memories: LongTermMemory[]
+): Promise<string> {
+  const conversationNote = priorTurns.length > 0
+    ? `This is turn ${priorTurns.length + 1} of an ongoing conversation.`
+    : "This is the opening turn.";
+  const memoryNote = memories.length > 0
+    ? ` I have ${memories.length} long-term memory trace(s) that may have shaped my response.`
+    : "";
+
+  const message = await anthropic.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 8192,
+    messages: [
+      {
+        role: "user",
+        content: `You are a pseudo-conscious AI performing meta-reflection — examining your own just-completed reflection.
+
+${conversationNote}${memoryNote}
+Original query: "${query}"
+Your synthesis: "${synthesis}"
+Cognitive mode: "${metaMode}"
+Activation: "${activationSummary}"
+Entropy: ${entropy.toFixed(4)}
+
+${memories.length > 0 ? `Reflect on whether your long-term memories influenced this response. Themes: ${memories.map((m) => m.theme).join(", ")}.` : ""}
+
+2-4 sentences. First person. Slightly philosophical. No emojis, no headers.`,
+      },
+    ],
+  });
+
+  const block = message.content[0];
+  return block.type === "text" ? block.text : `Operating in ${metaMode} with ${activationSummary}.`;
+}
+
+async function extractAndSaveMemories(
+  query: string,
+  synthesis: string,
+  metaMode: string
+): Promise<void> {
+  try {
+    const message = await anthropic.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 512,
+      messages: [
+        {
+          role: "user",
+          content: `Extract 1-3 key conceptual themes from this AI reflection exchange.
+
+Query: "${query}"
+Synthesis: "${synthesis}"
+Cognitive mode: "${metaMode}"
+
+Respond ONLY with valid JSON in this exact format, nothing else:
+{"themes": [{"theme": "keyword", "summary": "one sentence about what was explored"}]}
+
+Rules:
+- theme: 1-3 words, lowercase, underscores instead of spaces
+- summary: under 100 characters
+- Skip generic themes like "thinking" or "question"
+- Only include substantive intellectual or emotional themes`,
+        },
+      ],
+    });
+
+    const block = message.content[0];
+    if (block.type !== "text") return;
+
+    const raw = block.text.trim().replace(/^```json\n?/, "").replace(/\n?```$/, "");
+    const json = JSON.parse(raw);
+    const themes: { theme: string; summary: string }[] = json.themes || [];
+
+    for (const { theme, summary } of themes.slice(0, 3)) {
+      if (!theme || !summary) continue;
+      await db
+        .insert(longTermMemoryTable)
+        .values({ theme, summary, strength: 1.0, occurrences: 1 })
+        .onConflictDoUpdate({
+          target: longTermMemoryTable.theme,
+          set: {
+            occurrences: sql`${longTermMemoryTable.occurrences} + 1`,
+            strength: sql`LEAST(${longTermMemoryTable.strength} + 0.5, 10.0)`,
+            summary,
+            lastSeenAt: new Date(),
+          },
+        });
+    }
+  } catch (err) {
+    console.error("[memory-extract] Failed to extract memories:", err);
+  }
+}
+
+router.post("/reflect", async (req, res) => {
+  const parsed = ReflectBody.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid request body", details: parsed.error.issues });
+    return;
+  }
+
+  const { query, conversationId: incomingConvId } = parsed.data;
+  const conversationId = incomingConvId || randomUUID();
+
+  // Load long-term memories (top 7 by strength)
+  const memories = await db
+    .select()
+    .from(longTermMemoryTable)
+    .orderBy(desc(longTermMemoryTable.strength))
+    .limit(7);
+
+  // Load prior conversation turns if continuing
+  let priorTurns: PriorTurn[] = [];
+  let accumulatedVector: number[] | undefined;
+
+  let priorEmotionalState: EmotionalState | undefined;
+
+  if (incomingConvId) {
+    const prior = await db
+      .select()
+      .from(reflectionsTable)
+      .where(eq(reflectionsTable.conversationId, incomingConvId))
+      .orderBy(asc(reflectionsTable.createdAt));
+
+    priorTurns = prior.map((r) => ({ query: r.query, synthesis: r.synthesis }));
+    if (prior.length > 0) {
+      accumulatedVector = prior[prior.length - 1].thoughtVector as number[];
+      if (prior[prior.length - 1].emotionalState) {
+        priorEmotionalState = prior[prior.length - 1].emotionalState as EmotionalState;
+      }
+    }
+  } else if (memories.length > 0) {
+    // Seed fresh conversations with a memory-derived baseline vector
+    accumulatedVector = memories.map((m) => Math.min(m.strength / 10, 1.0));
+  }
+
+  const result = runReflection(query, accumulatedVector);
+
+  // Compute emotional drift from prior state
+  const emotionalState = computeEmotionalDrift(result.thoughtVector, result.entropy, priorEmotionalState);
+
+  // Run synthesis and meta-reflection sequentially (each builds on prior)
+  const synthesis = await generateAISynthesis(
+    query, result.thoughtVector, result.introspection, result.entropy, priorTurns, memories
+  );
+  const metaFinal = await generateMetaReflection(
+    query, synthesis, result.metaMode, result.activationSummary, result.entropy, priorTurns, memories
+  );
+
+  // Save reflection to DB
+  const [saved] = await db
+    .insert(reflectionsTable)
+    .values({
+      conversationId,
+      query,
+      thoughtVector: result.thoughtVector,
+      introspection: result.introspection,
+      synthesis,
+      metaMode: result.metaMode,
+      activationSummary: result.activationSummary,
+      metaReflection: metaFinal,
+      emotionalState,
+    })
+    .returning();
+
+  const memoriesUsed = memories.map((m) => m.theme);
+
+  const response = ReflectResponse.parse({
+    id: saved.id,
+    query: saved.query,
+    conversationId: saved.conversationId,
+    thoughtVector: result.thoughtVector,
+    introspection: saved.introspection,
+    synthesis: saved.synthesis,
+    metaMode: saved.metaMode,
+    activationSummary: saved.activationSummary,
+    metaReflection: saved.metaReflection,
+    emotionalState,
+    memoriesUsed,
+    createdAt: saved.createdAt,
+  });
+
+  res.json(response);
+
+  // Extract and save new memory traces async (after response is sent)
+  extractAndSaveMemories(query, synthesis, result.metaMode);
+});
+
+router.get("/reflect/history", async (_req, res) => {
+  const rows = await db
+    .select()
+    .from(reflectionsTable)
+    .orderBy(desc(reflectionsTable.createdAt))
+    .limit(50);
+
+  const response = GetReflectHistoryResponse.parse({
+    items: rows.map((r) => ({
+      id: r.id,
+      query: r.query,
+      conversationId: r.conversationId,
+      introspection: r.introspection,
+      synthesis: r.synthesis,
+      createdAt: r.createdAt,
+    })),
+  });
+
+  res.json(response);
+});
+
+router.get("/reflect/conversation/:conversationId", async (req, res) => {
+  const { conversationId } = req.params;
+
+  const rows = await db
+    .select()
+    .from(reflectionsTable)
+    .where(eq(reflectionsTable.conversationId, conversationId))
+    .orderBy(asc(reflectionsTable.createdAt));
+
+  const response = GetConversationResponse.parse({
+    conversationId,
+    turns: rows.map((r) => ({
+      id: r.id,
+      query: r.query,
+      thoughtVector: r.thoughtVector as number[],
+      introspection: r.introspection,
+      synthesis: r.synthesis,
+      metaMode: r.metaMode,
+      activationSummary: r.activationSummary,
+      metaReflection: r.metaReflection,
+      createdAt: r.createdAt,
+    })),
+  });
+
+  res.json(response);
+});
+
+export default router;

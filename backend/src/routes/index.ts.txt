@@ -1,0 +1,12 @@
+import { Router, type IRouter } from "express";
+import healthRouter from "./health";
+import reflectRouter from "./reflect";
+import memoryRouter from "./memory";
+
+const router: IRouter = Router();
+
+router.use(healthRouter);
+router.use(reflectRouter);
+router.use(memoryRouter);
+
+export default router;
