@@ -1,0 +1,35 @@
+import { useState } from "react";
+import { reflect } from "./api";
+
+export default function App() {
+  const [input, setInput] = useState("");
+  const [response, setResponse] = useState("");
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    const result = await reflect(input);
+    setResponse(result.output);
+  }
+
+  return (
+    <div style={{ padding: 20 }}>
+      <h1>AI Reflection</h1>
+
+      <form onSubmit={handleSubmit}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Say something..."
+        />
+        <button type="submit">Send</button>
+      </form>
+
+      {response && (
+        <div style={{ marginTop: 20 }}>
+          <h2>Response:</h2>
+          <p>{response}</p>
+        </div>
+      )}
+    </div>
+  );
+}

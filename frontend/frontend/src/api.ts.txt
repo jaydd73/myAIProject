@@ -1,0 +1,9 @@
+export async function reflect(message: string) {
+  const response = await fetch("http://localhost:3001/reflect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+
+  return response.json();
+}
